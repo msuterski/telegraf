@@ -38,6 +38,8 @@ type (
 		// MaxRetry Tag
 		MaxRetry int
 
+		Version string `toml:"version"`
+
 		// Legacy TLS config options
 		// TLS client certificate
 		Certificate string
@@ -177,6 +179,7 @@ func (k *Kafka) GetTopicName(metric telegraf.Metric) string {
 	default:
 		topicName = k.Topic
 	}
+
 	return topicName
 }
 
@@ -190,6 +193,14 @@ func (k *Kafka) Connect() error {
 		return err
 	}
 	config := sarama.NewConfig()
+
+	if k.Version != "" {
+		version, err := sarama.ParseKafkaVersion(k.Version)
+		if err != nil {
+			return err
+		}
+		config.Version = version
+	}
 
 	if k.ClientID != "" {
 		config.ClientID = k.ClientID
@@ -246,31 +257,49 @@ func (k *Kafka) Description() string {
 }
 
 func (k *Kafka) Write(metrics []telegraf.Metric) error {
-	if len(metrics) == 0 {
-		return nil
+	batches := make(map[string]map[string][]telegraf.Metric)
+	for _, metric := range metrics {
+		topicName := k.GetTopicName(metric)
+		if _, ok := batches[topicName]; !ok {
+			batches[topicName] = make(map[string][]telegraf.Metric)
+		}
+
+		key, _ := metric.GetTag(k.RoutingTag)
+		if _, ok := batches[topicName][key]; !ok {
+			batches[topicName][key] = make([]telegraf.Metric, 0)
+		}
+
+		batches[topicName][key] = append(batches[topicName][key], metric)
 	}
 
-	for _, metric := range metrics {
-		buf, err := k.serializer.Serialize(metric)
-		if err != nil {
-			return err
-		}
+	msgs := make([]*sarama.ProducerMessage, 0, len(metrics))
+	for topicName, v := range batches {
+		for routingKey, metrics := range v {
 
-		topicName := k.GetTopicName(metric)
+			buf, err := k.serializer.SerializeBatch(metrics)
+			if err != nil {
+				return err
+			}
 
-		m := &sarama.ProducerMessage{
-			Topic: topicName,
-			Value: sarama.ByteEncoder(buf),
-		}
-		if h, ok := metric.Tags()[k.RoutingTag]; ok {
-			m.Key = sarama.StringEncoder(h)
-		}
+			m := &sarama.ProducerMessage{
+				Topic: topicName,
+				Value: sarama.ByteEncoder(buf),
+				Key:   sarama.StringEncoder(routingKey),
+			}
 
-		_, _, err = k.producer.SendMessage(m)
-
-		if err != nil {
-			return fmt.Errorf("FAILED to send kafka message: %s\n", err)
+			msgs = append(msgs, m)
 		}
+	}
+
+	err := k.producer.SendMessages(msgs)
+	if err != nil {
+		// Return the first message specific error
+		if errs, ok := err.(sarama.ProducerErrors); ok {
+			for _, prodErr := range errs {
+				return prodErr
+			}
+		}
+		return err
 	}
 	return nil
 }
